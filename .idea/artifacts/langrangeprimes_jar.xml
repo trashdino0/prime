@@ -1,0 +1,8 @@
+<component name="ArtifactManager">
+  <artifact type="jar" name="langrangeprimes:jar">
+    <output-path>$PROJECT_DIR$/out/artifacts/langrangeprimes_jar</output-path>
+    <root id="archive" name="langrangeprimes.jar">
+      <element id="module-output" name="langrangeprimes" />
+    </root>
+  </artifact>
+</component>
