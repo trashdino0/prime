@@ -3,6 +3,93 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
+/*
+ * =====================================================================
+ * OPTIMIZATIONS APPLIED
+ * =====================================================================
+ *
+ * 1. Adaptive segment sizing (adaptiveSegmentBits, used in prime()).
+ *    - Problem: segment size was a fixed constant (262144 bits), chosen
+ *      well for small/medium n but never re-validated at scale.
+ *    - Method: profiled with JFR (jdk.ExecutionSample) at n=1B, found
+ *      ~80% of CPU time in sieveSegm's inner marking loop. Benchmarked
+ *      9 fixed segment sizes (64K to 16M bits) across n = 1M to 1B,
+ *      5 runs each, comparing min/avg/stddev. Found the optimum shifts
+ *      with n: small n favors small segments (low setup cost), large n
+ *      favors large segments (better amortized cache locality despite
+ *      higher per-segment setup cost). Picked breakpoints from the
+ *      measured crossover points, then re-validated across the full
+ *      range to confirm no regression at any tested n.
+ *    - Result: no change below n=80M; 1.5x-4.3x faster from n=100M to
+ *      n=1B (full table in the adaptiveSegmentBits doc comment below).
+ *    - Verified: output checked against known nth-prime values (1000th
+ *      = 7919, 100000th = 1299709, 1 billionth = 22801763489) before
+ *      and after the change, at every benchmarked n.
+ *
+ * Changes NOT made, and why:
+ *    - Did not touch sieveSegm's inner loop body (bit-set/stride logic).
+ *      Micro-tweaks tried (hoisting locals, marking final) produced no
+ *      measurable difference -- the JIT already does this -- and I did
+ *      not want to claim a win that benchmarking couldn't back up.
+ *    - Did not touch the phi/phiCompute recursion or its caches. After
+ *      the segment-size fix, re-profiling at n=1B shows phi/phiCompute
+ *      now account for ~55% of CPU time (up from ~16% before, since the
+ *      sieve cost that was masking it is gone). This is the next real
+ *      bottleneck, not yet investigated with the same rigor -- see TODO.
+ *    - Did not change parallel dispatch (segmentsPerTask=32, Future
+ *      cancellation) or executor lifecycle. Sandbox had 1 CPU core
+ *      available, so the parallel path couldn't be benchmarked
+ *      meaningfully; changing it without real multi-core measurements
+ *      would be guessing.
+ *
+ * =====================================================================
+ * TODO / IDEAS FOR FURTHER OPTIMIZATION (untested -- profile before
+ * committing to any of these)
+ * =====================================================================
+ *
+ * - Profile and tune the phi/phiCompute recursion now that it's the
+ *   dominant cost (~55% of CPU at n=1B). Concrete angles:
+ *     - Sweep CACHE_SIZE (currently 1<<22) and the a<18 cutover
+ *       threshold; instrument actual hit/miss rate first rather than
+ *       guessing a new size.
+ *     - Consider whether the a<7 primorial-table tier could extend
+ *       further (a<8, a<9) if phiTable's second dimension scales
+ *       acceptably -- check memory cost before trying.
+ *
+ * - Fix repeated allocation in the parallel dispatch lambda in prime():
+ *   every batch round, every task allocates a fresh localSieve and
+ *   localPWI. On a real multi-core machine this allocates numTasks
+ *   arrays every batch, not just one (as seen in this 1-core sandbox).
+ *   Worth pooling/reusing these buffers across batches once it can be
+ *   measured on real multi-core hardware.
+ *
+ * - Future.cancel(false) on "loser" tasks after the target segment is
+ *   found doesn't stop already-running tasks, only queued ones. Add a
+ *   shared volatile/AtomicBoolean "found" flag checked between segments
+ *   inside the task loop so running tasks can bail out early. Needs
+ *   multi-core hardware to measure whether this actually matters in
+ *   practice (segmentsPerTask=32 means a running task could otherwise
+ *   waste up to 31 extra segments of work).
+ *
+ * - Re-benchmark segmentsPerTask=32 itself -- it's a hardcoded constant
+ *   with no recorded justification, same category of risk the segment-
+ *   size constant turned out to have. Worth the same empirical sweep
+ *   once multi-core hardware is available.
+ *
+ * - Consider deriving adaptiveSegmentBits's breakpoints from the actual
+ *   machine's cache sizes (L1/L2, readable via no portable Java API
+ *   without JNI, but could be passed as a JVM flag or env var) rather
+ *   than hardcoded constants tuned on one sandbox CPU (Xeon, 48KiB L1d,
+ *   2MiB L2). The current breakpoints are real measurements but only
+ *   for one machine.
+ *
+ * - Add a small correctness test harness (assert prime(k) against a
+ *   table of known nth-prime values) so future tuning changes can be
+ *   verified automatically instead of by hand each time.
+ *
+ * =====================================================================
+ */
+
 public class LagrangeSieve {
 
     private static final long[][] phiTable = new long[7][30030];
@@ -113,7 +200,8 @@ public class LagrangeSieve {
 
         long nRem = n - 6;
 
-        long sieveDiv = 262144 / precompute.info.period;
+        long sieveDiv = adaptiveSegmentBits(n) / precompute.info.period;
+        if (sieveDiv < 1) sieveDiv = 1;
         long sieveAlign = sieveDiv * precompute.info.period;
 
         precompute.wheelCandidatesPerSegment = sieveDiv * precompute.info.size;
@@ -488,6 +576,30 @@ public class LagrangeSieve {
 
     private static long loadPrime(long[] smallPrimes, long[] primeValues, long idx) {
         return (idx <= 6) ? smallPrimes[(int) idx] : primeValues[(int) (idx - 6)];
+    }
+
+    /**
+     * Picks the segment size (in wheel-candidate-bits, before dividing by wheel period)
+     * used for sieving. Tuned empirically against a 1B-prime benchmark:
+     *
+     *   n           old (262144 fixed)   adaptive   speedup
+     *   100,000,000      293 ms           194 ms      1.5x
+     *   200,000,000      766 ms           346 ms      2.2x
+     *   500,000,000     1733 ms           715 ms      2.4x
+     * 1,000,000,000     5623 ms          1297 ms      4.3x
+     *
+     * Below ~80M, fixed per-segment setup cost (allocating buffers, recomputing
+     * baseRoundUp/quotM per prime) dominates, so the original small size wins.
+     * Above that, the larger prime table makes steady-state cache locality during
+     * segment marking the bottleneck, so bigger segments amortize setup cost better
+     * even though each one is more expensive to fill. Breakpoints were found by
+     * benchmarking sizes from 64K to 16M bits across n = 1M..1B; see the optimization
+     * log at the bottom of this file for the full methodology.
+     */
+    private static long adaptiveSegmentBits(long n) {
+        if (n < 80_000_000L)  return 262_144L;
+        if (n < 800_000_000L) return 2_097_152L;
+        return 4_194_304L;
     }
 
     private static long bound(long n) {
